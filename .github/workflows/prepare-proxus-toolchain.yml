@@ -1,0 +1,219 @@
+name: Prepare Proxus offline toolchain
+
+# Runs only for changes to this bootstrap workflow, or by manual request.
+# This prepares public dependencies, NOT Proxus Enterprise/customer source.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/prepare-proxus-toolchain.yml']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: proxus-toolchain
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      KIT: ${{ github.workspace }}/portable
+      DOTNET_ROOT: ${{ github.workspace }}/portable/dotnet
+      DOTNET_CLI_HOME: ${{ runner.temp }}/dotnet-home
+      NUGET_PACKAGES: ${{ github.workspace }}/portable/nuget-packages
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_SKIP_FIRST_TIME_EXPERIENCE: '1'
+      DOTNET_NOLOGO: '1'
+      DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE: '1'
+    steps:
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install .NET 10 into the portable directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$KIT" "$DOTNET_CLI_HOME"
+          curl --fail --location --retry 3 --proto '=https' --tlsv1.2 \
+            https://dot.net/v1/dotnet-install.sh -o "$RUNNER_TEMP/dotnet-install.sh"
+          bash "$RUNNER_TEMP/dotnet-install.sh" --channel 10.0 --quality GA \
+            --install-dir "$DOTNET_ROOT" --no-path
+          echo "$DOTNET_ROOT" >> "$GITHUB_PATH"
+          "$DOTNET_ROOT/dotnet" --info | tee "$KIT/dotnet-info.txt"
+          VERSION=$("$DOTNET_ROOT/dotnet" --version)
+          printf '{"sdk":{"version":"%s","rollForward":"disable"}}\n' "$VERSION" > "$KIT/global.json"
+
+      - name: Install Native AOT compiler dependencies on the runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang zlib1g-dev libicu-dev libssl-dev zstd
+
+      - name: Prepare and validate the .NET dependency cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KIT"
+          dotnet new web --name Probe --output probe --framework net10.0 --no-restore
+          cat > probe/Program.cs <<'CS'
+          var builder = WebApplication.CreateSlimBuilder(args);
+          var app = builder.Build();
+          app.MapGet("/health", () => "proxus-toolchain-ok");
+          app.Run();
+          CS
+          dotnet add probe/Probe.csproj package NATS.Net
+          dotnet add probe/Probe.csproj package Npgsql
+          dotnet add probe/Probe.csproj package Microsoft.Data.Sqlite --version '10.*'
+          dotnet restore probe/Probe.csproj -r linux-x64 --use-lock-file -p:PublishAot=true
+          dotnet publish probe/Probe.csproj -c Release -r linux-x64 -p:PublishAot=true \
+            --no-restore -o "$RUNNER_TEMP/proxus-aot-probe"
+          "$RUNNER_TEMP/proxus-aot-probe/Probe" --urls http://127.0.0.1:18765 > "$KIT/probe-run.log" 2>&1 &
+          PROBE_PID=$!
+          trap 'kill "$PROBE_PID" 2>/dev/null || true' EXIT
+          for n in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:18765/health > "$KIT/probe-result.txt"; then break; fi
+            sleep 1
+          done
+          grep -qx 'proxus-toolchain-ok' "$KIT/probe-result.txt"
+          kill "$PROBE_PID"
+          wait "$PROBE_PID" || true
+          trap - EXIT
+          cat > "$KIT/NuGet.offline.config" <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration><packageSources><clear /></packageSources></configuration>
+          XML
+          rm -rf probe/obj probe/bin
+          dotnet restore probe/Probe.csproj -r linux-x64 -p:PublishAot=true \
+            --locked-mode --configfile "$KIT/NuGet.offline.config"
+          dotnet publish probe/Probe.csproj -c Release -r linux-x64 -p:PublishAot=true \
+            --no-restore -o "$RUNNER_TEMP/proxus-aot-probe-offline"
+          rm -rf probe/obj probe/bin
+
+      - name: Prepare React 19 and build-tool caches
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$KIT/ui-deps" "$KIT/node"
+          NODE_ROOT=$(dirname "$(dirname "$(readlink -f "$(command -v node)")")")
+          cp -a "$NODE_ROOT/." "$KIT/node/"
+          cd "$KIT/ui-deps"
+          cat > package.json <<'JSON'
+          {
+            "name": "proxus-offline-ui-deps", "private": true,
+            "dependencies": {"react": "~19.2.0", "react-dom": "~19.2.0"},
+            "devDependencies": {
+              "typescript": "5.9.2", "vite": "^7.1.0",
+              "@types/react": "^19.2.0", "@types/react-dom": "^19.2.0"
+            }
+          }
+          JSON
+          npm install --cache "$KIT/npm-cache" --no-audit --no-fund
+          rm -rf node_modules
+          npm ci --offline --cache "$KIT/npm-cache" --no-audit --no-fund
+          node -e "console.log('React', require('react').version)" > "$KIT/react-info.txt"
+          printf '<div id="root"></div><script type="module" src="/main.jsx"></script>\n' > index.html
+          cat > main.jsx <<'JS'
+          import React from 'react';
+          import { createRoot } from 'react-dom/client';
+          createRoot(document.getElementById('root')).render(<main>Proxus React 19 build probe</main>);
+          JS
+          ./node_modules/.bin/vite build
+          test -f dist/index.html
+          rm -rf dist node_modules
+
+      - name: Write the portable activation script and manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$KIT/activate.sh" <<'SH'
+          #!/usr/bin/env bash
+          # Usage: source /path/to/portable/activate.sh
+          if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+            echo 'Use: source /path/to/portable/activate.sh' >&2
+            exit 2
+          fi
+          export PROXUS_TOOLCHAIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          export DOTNET_ROOT="$PROXUS_TOOLCHAIN/dotnet"
+          export NUGET_PACKAGES="$PROXUS_TOOLCHAIN/nuget-packages"
+          export npm_config_cache="$PROXUS_TOOLCHAIN/npm-cache"
+          export DOTNET_CLI_HOME="$PROXUS_TOOLCHAIN/.dotnet-home"
+          export DOTNET_CLI_TELEMETRY_OPTOUT=1
+          export DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
+          export DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE=1
+          export PATH="$DOTNET_ROOT:$PROXUS_TOOLCHAIN/node/bin:$PATH"
+          mkdir -p "$DOTNET_CLI_HOME"
+          dotnet --version
+          node --version
+          SH
+          chmod +x "$KIT/activate.sh"
+          cd "$KIT"
+          {
+            echo "Built UTC: $(date -u +%FT%TZ)"
+            echo "Runner: ubuntu-24.04 / linux-x64"
+            echo "SDK: $(dotnet --version)"
+            echo "Node: $(node --version)"
+            echo "npm: $(npm --version)"
+            echo "Native AOT probe: passed"
+            echo "Restore with no remote NuGet sources: passed for Probe lock file"
+            echo "npm ci --offline and React production build probe: passed"
+            echo "Dependency runtime integrations: NOT exercised by the health probe"
+            echo "Proxus application build: NOT performed by this workflow"
+            echo "Receiver VM compatibility: NOT yet tested"
+          } > MANIFEST.txt
+          rm -rf "$KIT/npm-cache/_logs" "$KIT/.dotnet-home"
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          tar -I 'zstd -T0 -6' -cf "$GITHUB_WORKSPACE/artifacts/dotnet-sdk.tar.zst" dotnet
+          tar -I 'zstd -T0 -6' -cf "$GITHUB_WORKSPACE/artifacts/nuget-cache.tar.zst" nuget-packages
+          tar -I 'zstd -T0 -6' -cf "$GITHUB_WORKSPACE/artifacts/node-npm.tar.zst" node npm-cache
+          tar -I 'zstd -T0 -6' -cf "$GITHUB_WORKSPACE/artifacts/support.tar.zst" \
+            activate.sh global.json NuGet.offline.config probe ui-deps \
+            MANIFEST.txt dotnet-info.txt react-info.txt probe-result.txt probe-run.log
+          cd "$GITHUB_WORKSPACE/artifacts"
+          sha256sum *.tar.zst > SHA256SUMS
+          cat "$KIT/MANIFEST.txt" >> "$GITHUB_STEP_SUMMARY"
+          printf '\nArchive sizes:\n' >> "$GITHUB_STEP_SUMMARY"
+          du -h *.tar.zst >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload SDK
+        uses: actions/upload-artifact@v4
+        with:
+          name: proxus-dotnet-sdk-linux-x64
+          path: artifacts/dotnet-sdk.tar.zst
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload NuGet cache
+        uses: actions/upload-artifact@v4
+        with:
+          name: proxus-nuget-cache-linux-x64
+          path: artifacts/nuget-cache.tar.zst
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload Node and npm cache
+        uses: actions/upload-artifact@v4
+        with:
+          name: proxus-node-npm-linux-x64
+          path: artifacts/node-npm.tar.zst
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload manifests and activation scripts
+        uses: actions/upload-artifact@v4
+        with:
+          name: proxus-toolchain-support
+          path: |
+            artifacts/support.tar.zst
+            artifacts/SHA256SUMS
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
