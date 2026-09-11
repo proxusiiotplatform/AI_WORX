@@ -10,43 +10,38 @@ jobs:
   services:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [nats, clickhouse]
     steps:
-      - name: Download public service binaries
+      - name: Download public service binary and verify release digest
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          SERVICE: ${{ matrix.service }}
         run: |
           set -euo pipefail
-          mkdir -p services/nats services/clickhouse artifacts
-          gh release view --repo nats-io/nats-server --json tagName > services/nats-release.json
-          NATS_TAG=$(jq -r .tagName services/nats-release.json)
-          gh release download "$NATS_TAG" --repo nats-io/nats-server --pattern '*linux-amd64.tar.gz' --dir /tmp/nats-download
-          tar -xzf /tmp/nats-download/*.tar.gz --strip-components=1 -C services/nats
-          gh release view --repo ClickHouse/ClickHouse --json tagName > services/clickhouse-release.json
-          CH_TAG=$(jq -r .tagName services/clickhouse-release.json)
-          gh release download "$CH_TAG" --repo ClickHouse/ClickHouse --pattern 'clickhouse-common-static-*_amd64.tgz' --dir /tmp/ch-download
-          tar -xzf /tmp/ch-download/*.tgz --strip-components=1 -C services/clickhouse
-          services/nats/nats-server --version > services/versions.txt
-          services/clickhouse/usr/bin/clickhouse local --version >> services/versions.txt
-          tar -czf artifacts/nats-service.tar.gz -C services nats nats-release.json versions.txt
-          tar -cf - -C services clickhouse clickhouse-release.json | zstd -T0 -3 > artifacts/clickhouse-service.tar.zst
-          cd artifacts && sha256sum * > SHA256SUMS
+          mkdir -p payload artifacts
+          if [ "$SERVICE" = nats ]; then
+            gh api repos/nats-io/nats-server/releases/latest > release.json
+            jq -e '.assets[] | select(.name | endswith("-amd64.deb"))' release.json > asset.json
+          else
+            gh api repos/ClickHouse/ClickHouse/releases/latest > release.json
+            jq -e '.assets[] | select((.name | startswith("clickhouse-common-static_")) and (.name | endswith("_amd64.deb")))' release.json > asset.json
+          fi
+          jq -r '.name,.browser_download_url' asset.json
+          curl --fail --location --retry 3 "$(jq -r .browser_download_url asset.json)" -o package.deb
+          DIGEST=$(jq -r '.digest // ""' asset.json)
+          if [[ "$DIGEST" == sha256:* ]]; then echo "${DIGEST#sha256:}  package.deb" | sha256sum -c -; fi
+          dpkg-deb -x package.deb payload
+          cp release.json asset.json payload/
+          if [ "$SERVICE" = nats ]; then payload/usr/bin/nats-server --version > payload/versions.txt; else payload/usr/bin/clickhouse local --version > payload/versions.txt; fi
+          tar -cf - -C payload . | zstd -T0 -3 > artifacts/$SERVICE-service.tar.zst
+          cd artifacts && sha256sum *.tar.zst > SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
-          name: integration-nats
-          path: artifacts/nats-service.tar.gz
+          name: integration-${{ matrix.service }}
+          path: artifacts/*
           compression-level: 0
-          retention-days: 7
-      - uses: actions/upload-artifact@v4
-        with:
-          name: integration-clickhouse
-          path: artifacts/clickhouse-service.tar.zst
-          compression-level: 0
-          retention-days: 7
-      - uses: actions/upload-artifact@v4
-        with:
-          name: integration-manifest
-          path: |
-            artifacts/SHA256SUMS
-            services/versions.txt
           retention-days: 7
