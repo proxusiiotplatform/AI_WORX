@@ -9,16 +9,24 @@ permissions:
 jobs:
   public-tool:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
-      - name: Download the public Debian package
+      - name: Build pinned public source without setuid support
         run: |
           set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends meson ninja-build libcap-dev pkg-config
+          git clone --depth 1 --branch v0.11.2 https://github.com/containers/bubblewrap.git source
+          meson setup source/build source -Dsupport_setuid=false -Dman=disabled -Dtests=false
+          meson compile -C source/build
           mkdir -p artifact
-          curl --fail --location --retry 3 --proto '=https' --tlsv1.2 https://deb.debian.org/debian/pool/main/b/bubblewrap/bubblewrap_0.11.2-2_amd64.deb -o artifact/bubblewrap.deb
-          dpkg-deb -I artifact/bubblewrap.deb > artifact/package-info.txt
+          cp source/build/bwrap artifact/
+          chmod 0755 artifact/bwrap
+          artifact/bwrap --version > artifact/version.txt
+          git -C source rev-parse HEAD > artifact/source-commit.txt
+          ldd artifact/bwrap > artifact/ldd.txt
           cd artifact
-          sha256sum bubblewrap.deb > SHA256SUMS
+          sha256sum bwrap > SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: public-bubblewrap-test-binary
