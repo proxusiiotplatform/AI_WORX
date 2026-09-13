@@ -1,0 +1,40 @@
+name: Prepare public identity dependencies
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/prepare-identity-packages.yml']
+permissions:
+  contents: read
+jobs:
+  dependencies:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      NUGET_PACKAGES: ${{ github.workspace }}/packages
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+    steps:
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Restore and build public authentication package probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet new web -n IdentityProbe -f net10.0
+          dotnet add IdentityProbe/IdentityProbe.csproj package Microsoft.AspNetCore.Authentication.OpenIdConnect --version 10.0.12
+          dotnet restore IdentityProbe/IdentityProbe.csproj --use-lock-file -p:NuGetAudit=false
+          dotnet build IdentityProbe/IdentityProbe.csproj -c Release --no-restore
+          mkdir artifacts
+          cp IdentityProbe/packages.lock.json artifacts/packages.lock.json
+          dotnet --info > artifacts/sdk-info.txt
+          tar -czf artifacts/identity-nuget.tar.gz packages
+          cd artifacts
+          sha256sum identity-nuget.tar.gz > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: public-identity-nuget
+          path: artifacts/
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
