@@ -1,0 +1,29 @@
+name: Prepare PostgreSQL test binaries
+on:
+  workflow_dispatch:
+  push:
+    paths: ['.github/workflows/prepare-postgres-tests.yml']
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Download official Debian public packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p packages
+          base='https://ftp.debian.org/debian/pool/main/p/postgresql-17'
+          for package in postgresql-17 postgresql-client-17 libpq5; do
+            curl --fail --location --retry 2 "$base/${package}_17.11-0+deb13u1_amd64.deb" -o "packages/$package.deb"
+          done
+          cd packages
+          sha256sum *.deb > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: postgres17-public-test-packages
+          path: packages/
+          retention-days: 3
+          if-no-files-found: error
