@@ -1,0 +1,27 @@
+name: Prepare public bubblewrap test binary
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/prepare-bubblewrap-tests.yml']
+permissions:
+  contents: read
+jobs:
+  public-tool:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Download the public Debian package
+        run: |
+          set -euo pipefail
+          mkdir -p artifact
+          curl --fail --location --retry 3 --proto '=https' --tlsv1.2 https://deb.debian.org/debian/pool/main/b/bubblewrap/bubblewrap_0.11.2-2_amd64.deb -o artifact/bubblewrap.deb
+          dpkg-deb -I artifact/bubblewrap.deb > artifact/package-info.txt
+          cd artifact
+          sha256sum bubblewrap.deb > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: public-bubblewrap-test-binary
+          path: artifact/
+          retention-days: 3
+          if-no-files-found: error
