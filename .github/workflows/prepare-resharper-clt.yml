@@ -28,12 +28,17 @@ jobs:
           chmod +x resharper-clt/inspectcode.sh resharper-clt/cleanupcode.sh
           ./resharper-clt/inspectcode.sh --version
           printf 'ReSharper CLT: %s\nSHA256: %s\n' "$VERSION" '5cab3b6fc3cf0957f0fcaf92fcf2a99ff11f9866c3e13caf552afe4c673add57' > resharper-clt/MANIFEST.txt
+          tar -I 'zstd -T0 -9' -cf resharper-clt.tar.zst resharper-clt
+          sha256sum resharper-clt.tar.zst > resharper-clt.tar.zst.sha256
+          ls -lh resharper-clt.tar.zst
 
       - name: Upload ReSharper CLT
         uses: actions/upload-artifact@v4
         with:
-          name: resharper-clt-2026.2.1
-          path: resharper-clt
+          name: resharper-clt-2026.2.1-zstd
+          path: |
+            resharper-clt.tar.zst
+            resharper-clt.tar.zst.sha256
           compression-level: 0
           retention-days: 7
           if-no-files-found: error
