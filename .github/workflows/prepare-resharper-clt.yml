@@ -1,0 +1,39 @@
+name: Prepare ReSharper command line tools
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/prepare-resharper-clt.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Download ReSharper command line tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=2026.2.1
+          URL="https://download.jetbrains.com/resharper/dotUltimate.${VERSION}/JetBrains.ReSharper.CommandLineTools.${VERSION}.zip"
+          curl --fail --location --retry 3 --proto '=https' --tlsv1.2 "$URL" -o resharper-clt.zip
+          echo '5cab3b6fc3cf0957f0fcaf92fcf2a99ff11f9866c3e13caf552afe4c673add57  resharper-clt.zip' | sha256sum -c -
+          unzip -q resharper-clt.zip -d resharper-clt
+          test -f resharper-clt/inspectcode.sh
+          test -f resharper-clt/cleanupcode.sh
+          chmod +x resharper-clt/inspectcode.sh resharper-clt/cleanupcode.sh
+          ./resharper-clt/inspectcode.sh --version
+          printf 'ReSharper CLT: %s\nSHA256: %s\n' "$VERSION" '5cab3b6fc3cf0957f0fcaf92fcf2a99ff11f9866c3e13caf552afe4c673add57' > resharper-clt/MANIFEST.txt
+
+      - name: Upload ReSharper CLT
+        uses: actions/upload-artifact@v4
+        with:
+          name: resharper-clt-2026.2.1
+          path: resharper-clt
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
