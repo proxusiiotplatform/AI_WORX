@@ -1,0 +1,30 @@
+name: Prepare public sandbox tools
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/prepare-sandbox-tools.yml']
+permissions:
+  contents: read
+jobs:
+  packages:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Download signed-distribution public packages only
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          mkdir artifacts
+          cd artifacts
+          apt-get download bubblewrap libcap2 libseccomp2
+          sha256sum *.deb > SHA256SUMS
+          apt-cache policy bubblewrap > PACKAGE-POLICY.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: public-sandbox-tools-linux-x64
+          path: artifacts/
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
